@@ -80,7 +80,38 @@ def part1a_zone_windows():
     """
     rides = read_rides()
     # TODO
-    return None
+
+    windowed = (
+        rides
+        .withWatermark("event_time", "3 minutes")
+        .groupBy(
+            window(col("event_time"), "5 minutes"),
+            col("pickup_zone")
+        )
+        .agg(
+            count("*").alias("trips"),
+            sround(ssum("fare"), 2).alias("revenue")
+        )
+        .select(
+            col("window.start").alias("window_start"),
+            col("window.end").alias("window_end"),
+            "pickup_zone",
+            "trips",
+            "revenue"
+        )
+    )
+
+    query = (
+        windowed.writeStream
+        .format("parquet")
+        .outputMode("append")
+        .option("path", out_dir)
+        .option("checkpointLocation", ckpt_dir)
+        .trigger(availableNow=True)
+        .start()
+    )
+
+    return query
 
 
 # ---------------------------------------------------------------- Part 1b: alerts
@@ -94,7 +125,42 @@ def part1b_alerts():
     from pyspark.sql.functions import when
     rides = read_rides()
     # TODO
-    return None
+
+    alerts = (
+        rides
+        .filter(
+            (col("fare") > 150) |
+            (col("distance_km") == 0)
+        )
+        .withColumn(
+            "reason",
+            when(col("fare") > 150, "high_fare")
+            .otherwise("zero_distance")
+        )
+        .select(
+            "ride_id",
+            "event_time",
+            "pickup_zone",
+            "distance_km",
+            "duration_min",
+            "fare",
+            "reason"
+        )
+    )
+
+    query = (
+        alerts.writeStream
+        .format("csv")
+        .outputMode("append")
+        .option("header", True)
+        .option("timestampFormat", "yyyy-MM-dd HH:mm:ss")
+        .option("path", out_dir)
+        .option("checkpointLocation", ckpt_dir)
+        .trigger(availableNow=True)
+        .start()
+    )
+
+    return query
 
 
 # ---------------------------------------------------------------- Part 2: the fare model
@@ -142,7 +208,121 @@ def part2_train():
 
     # TODO: baseline, full, tuned (with ParamGridBuilder and CrossValidator); evaluate(...)
     #       each; save models[<best name>] under model_dir; return results
-    return None
+
+    baseline_pipeline = Pipeline(stages=[
+        VectorAssembler(
+            inputCols=["distance_km"],
+            outputCol="features"
+        ),
+        LinearRegression(
+            featuresCol="features",
+            labelCol="fare"
+        )
+    ])
+
+    baseline_model = baseline_pipeline.fit(trainDF)
+    evaluate("baseline", baseline_model)
+
+    indexers = [
+        StringIndexer(
+            inputCol="zone",
+            outputCol="zone_idx",
+            handleInvalid="keep"
+        ),
+        StringIndexer(
+            inputCol="payment_type",
+            outputCol="payment_idx",
+            handleInvalid="keep"
+        ),
+        StringIndexer(
+            inputCol="hour",
+            outputCol="hour_idx",
+            handleInvalid="keep"
+        )
+    ]
+
+    encoder = OneHotEncoder(
+        inputCols=[
+            "zone_idx",
+            "payment_idx",
+            "hour_idx"
+        ],
+        outputCols=[
+            "zone_ohe",
+            "payment_ohe",
+            "hour_ohe"
+        ]
+    )
+
+    assembler = VectorAssembler(
+        inputCols=[
+            "zone_ohe",
+            "payment_ohe",
+            "hour_ohe",
+            "distance_km",
+            "duration_min"
+        ],
+        outputCol="features"
+    )
+
+    lr = LinearRegression(
+        featuresCol="features",
+        labelCol="fare"
+    )
+
+    full_pipeline = Pipeline(
+        stages=indexers + [encoder, assembler, lr]
+    )
+
+    full_model = full_pipeline.fit(trainDF)
+    evaluate("full", full_model)
+
+    param_grid = (
+        ParamGridBuilder()
+        .addGrid(full_pipeline.getStages()[-1].regParam, [0.0, 0.1])
+        .build()
+    )
+
+    cross_validator = CrossValidator(
+        estimator=full_pipeline,
+        estimatorParamMaps=param_grid,
+        evaluator=rmse_eval,
+        numFolds=3,
+        parallelism=2,
+        seed=seed
+    )
+
+    cv_model = cross_validator.fit(trainDF)
+    tuned_model = cv_model.bestModel
+
+    evaluate("tuned", tuned_model)
+
+    print(
+        "Best regularization parameter:",
+        tuned_model.stages[-1].getRegParam()
+    )
+    print(
+        "Cross-validation fits:",
+        len(param_grid) * 3
+    )
+
+    # Select the model with the lowest test RMSE
+    best_name = min(
+        results,
+        key=lambda row: row[1]
+    )[0]
+
+    best_model = models[best_name]
+
+    print("Saving best model:", best_name)
+
+    best_model.write().overwrite().save(model_dir)
+
+    trainDF.unpersist()
+
+    return results
+
+
 
 
 # ---------------------------------------------------------------- Part 3: score the stream
@@ -156,7 +336,45 @@ def part3_score(threshold):
     ckpt_dir. Return the started query. No fit() anywhere in this function.
     """
     # TODO
-    return None
+    model = PipelineModel.load(model_dir)
+    rides = read_rides()
+    featured_rides = features_of(rides, "event_time")
+    predictions = model.transform(featured_rides)
+    anomalies = (
+        predictions
+        .withColumn(
+            "deviation",
+            sround(
+                sabs(col("fare") - col("prediction")),
+                2
+            )
+        )
+        .filter(col("deviation") > lit(threshold))
+        .select(
+            "ride_id",
+            "event_time",
+            "pickup_zone",
+            "distance_km",
+            "duration_min",
+            "payment_type",
+            "fare",
+            sround(col("prediction"), 2).alias("prediction"),
+            "deviation"
+        )
+    )
+    query = (
+        anomalies.writeStream
+        .format("csv")
+        .outputMode("append")
+        .option("header", True)
+        .option("timestampFormat", "yyyy-MM-dd HH:mm:ss")
+        .option("path", out_dir)
+        .option("checkpointLocation", ckpt_dir)
+        .trigger(availableNow=True)
+        .start()
+    )
+
+    return query
 
 
 # ---------------------------------------------------------------- main
